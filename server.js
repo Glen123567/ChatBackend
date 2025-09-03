@@ -1,17 +1,17 @@
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } = > from "url";
+import { fileURLToPath } from "url";
 import express from "express";
 import cors from "cors";
 import mongoose from "mongoose";
 import dotenv from "dotenv";
+import { ethers } from "ethers";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
 dotenv.config();
 
 // -------------------- SETUP --------------------
-// Not strictly needed for a backend-only file, but good practice
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -34,15 +34,13 @@ mongoose
   });
 
 // -------------------- MODELS --------------------
-
-// User Schema
 const userSchema = new mongoose.Schema(
   {
     username: { type: String, unique: true, required: true, trim: true },
     password: { type: String, required: true },
     email: { type: String, required: true, unique: true, trim: true, lowercase: true },
-    phone: { type: String, trim: true, default: "" }, // Made optional
-    dob: { type: String, trim: true, default: "" },   // Made optional
+    phone: { type: String, trim: true },
+    dob: { type: String, trim: true },
     walletAddress: { type: String, required: true, unique: true, lowercase: true, trim: true },
   },
   { timestamps: true }
@@ -66,74 +64,113 @@ const User = mongoose.model("User", userSchema);
 // Message Schema
 const messageSchema = new mongoose.Schema(
   {
-    sender: { type: String, required: true },
-    receiver: { type: String, required: true },
+    sender: { type: String, required: true, trim: true },
+    receiver: { type: String, required: true, trim: true },
     text: { type: String, required: true },
-    txHash: { type: String, default: "" }, // Placeholder for blockchain hash
+    txHash: { type: String, trim: true },
   },
   { timestamps: true }
 );
 
 const Message = mongoose.model("Message", messageSchema);
 
-
 // -------------------- MIDDLEWARE --------------------
-
-// JWT Authentication Middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+  const token = authHeader && authHeader.split(' ')[1];
 
-  if (token == null) return res.status(401).json({ success: false, message: "Authentication token required" });
+  if (!token) {
+    return res.sendStatus(401);
+  }
 
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ success: false, message: "Invalid or expired token" });
-    req.user = user; // Attach user payload to request
+    if (err) return res.sendStatus(403);
+    req.user = user;
     next();
   });
 };
-
 
 // -------------------- ROUTES --------------------
 app.get("/api", (req, res) => {
   res.send("✅ SecureChat Backend is running on Render!");
 });
 
-// --- Auth Endpoints ---
-
 // Register
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { username, password, email, phone, dob, walletAddress } = req.body;
 
+    console.log("Registration attempt:", { username, email, walletAddress });
+
     if (!username || !password || !email || !walletAddress) {
-      return res.status(400).json({ success: false, message: "Missing required fields: username, password, email, walletAddress" });
+      return res.status(400).json({ 
+        success: false, 
+        message: "Missing required fields: username, password, email, walletAddress" 
+      });
     }
 
-    const existing = await User.findOne({ $or: [{ username }, { email }, { walletAddress }] });
-    if (existing) {
-        let message = "User already exists.";
-        if (existing.username === username) message = "Username already taken.";
-        else if (existing.email === email) message = "Email already registered.";
-        else if (existing.walletAddress === walletAddress) message = "Wallet address already registered.";
-        return res.status(400).json({ success: false, message });
+    // Check for existing user
+    const existingUser = await User.findOne({
+      $or: [
+        { username: username.trim() },
+        { email: email.toLowerCase().trim() },
+        { walletAddress: walletAddress.toLowerCase().trim() }
+      ]
+    });
+
+    if (existingUser) {
+      let conflictField = "";
+      if (existingUser.username === username.trim()) conflictField = "username";
+      else if (existingUser.email === email.toLowerCase().trim()) conflictField = "email";
+      else if (existingUser.walletAddress === walletAddress.toLowerCase().trim()) conflictField = "wallet address";
+      
+      return res.status(400).json({ 
+        success: false, 
+        message: `User with this ${conflictField} already exists` 
+      });
+    }
+
+    // Validate wallet address format
+    if (!ethers.isAddress(walletAddress)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid wallet address format"
+      });
     }
 
     const user = new User({
-      username,
+      username: username.trim(),
       password,
-      email: email.toLowerCase(),
-      phone: phone || "", // Ensure it's not undefined if not provided
-      dob: dob || "",     // Ensure it's not undefined if not provided
-      walletAddress: walletAddress.toLowerCase(),
+      email: email.toLowerCase().trim(),
+      phone: phone?.trim(),
+      dob: dob?.trim(),
+      walletAddress: walletAddress.toLowerCase().trim(),
     });
 
-    await user.save();
+    const savedUser = await user.save();
+    console.log("User registered successfully:", savedUser.username);
 
-    res.status(201).json({ success: true, message: "User registered successfully", user });
+    res.status(201).json({ 
+      success: true, 
+      message: "User registered successfully", 
+      user: savedUser 
+    });
   } catch (err) {
     console.error("Register error:", err);
-    res.status(500).json({ success: false, message: "Server error: " + err.message });
+    
+    // Handle MongoDB duplicate key errors
+    if (err.code === 11000) {
+      const field = Object.keys(err.keyValue)[0];
+      return res.status(400).json({
+        success: false,
+        message: `${field.charAt(0).toUpperCase() + field.slice(1)} already exists`
+      });
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      message: "Registration failed: " + err.message 
+    });
   }
 });
 
@@ -142,113 +179,216 @@ app.post("/api/auth/login", async (req, res) => {
   try {
     const { username, password } = req.body;
 
-    const user = await User.findOne({ username });
-    if (!user) return res.status(401).json({ success: false, message: "Invalid credentials" });
+    console.log("Login attempt for username:", username);
+
+    if (!username || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Username and password are required"
+      });
+    }
+
+    const user = await User.findOne({ username: username.trim() });
+    if (!user) {
+      console.log("User not found:", username);
+      return res.status(401).json({ 
+        success: false, 
+        message: "Invalid credentials" 
+      });
+    }
 
     const match = await bcrypt.compare(password, user.password);
-    if (!match) return res.status(401).json({ success: false, message: "Invalid credentials" });
+    if (!match) {
+      console.log("Password mismatch for user:", username);
+      return res.status(401).json({ 
+        success: false, 
+        message: "Invalid credentials" 
+      });
+    }
 
-    const token = jwt.sign({ id: user._id, username: user.username }, process.env.JWT_SECRET, { expiresIn: "2h" });
+    const token = jwt.sign(
+      { id: user._id, username: user.username }, 
+      process.env.JWT_SECRET, 
+      { expiresIn: "24h" }
+    );
 
-    res.json({ success: true, token, user });
+    console.log("Login successful for user:", username);
+
+    res.json({ 
+      success: true, 
+      token, 
+      user: user.toJSON()
+    });
   } catch (err) {
     console.error("Login error:", err);
-    res.status(500).json({ success: false, message: "Server error: " + err.message });
+    res.status(500).json({ 
+      success: false, 
+      message: "Login failed: " + err.message 
+    });
   }
 });
 
-
-// --- User Endpoints (Protected) ---
-
-// Get all users
-app.get("/api/users", authenticateToken, async (req, res) => {
+// Get all users (for contact list)
+app.get("/api/users", async (req, res) => {
   try {
-    const users = await User.find().select("-password"); // Exclude passwords
+    const users = await User.find({}, '-password').sort({ username: 1 });
+    console.log(`Fetched ${users.length} users`);
     res.json(users);
   } catch (err) {
     console.error("Get users error:", err);
-    res.status(500).json({ success: false, message: "Server error: " + err.message });
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to fetch users: " + err.message 
+    });
   }
 });
 
-// Delete all users (for development/testing)
-app.delete("/api/users", authenticateToken, async (req, res) => {
+// Delete all users (admin function)
+app.delete("/api/users", async (req, res) => {
   try {
-    await User.deleteMany({});
-    await Message.deleteMany({}); // Also delete all messages
-    res.json({ success: true, message: "All users and messages deleted" });
+    const result = await User.deleteMany({});
+    console.log(`Deleted ${result.deletedCount} users`);
+    res.json({ 
+      success: true, 
+      message: `Deleted ${result.deletedCount} users`,
+      deletedCount: result.deletedCount
+    });
   } catch (err) {
-    console.error("Delete all users error:", err);
-    res.status(500).json({ success: false, message: "Server error: " + err.message });
+    console.error("Delete users error:", err);
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to delete users: " + err.message 
+    });
   }
 });
-
-
-// --- Message Endpoints (Protected) ---
 
 // Get messages between two users
-app.get("/api/messages/:u1/:u2", authenticateToken, async (req, res) => {
-    try {
-        const { u1, u2 } = req.params;
-        const messages = await Message.find({
-            $or: [
-                { sender: u1, receiver: u2 },
-                { sender: u2, receiver: u1 },
-            ],
-        }).sort({ createdAt: 1 }); // Sort by creation time
-
-        res.json(messages);
-    } catch (err) {
-        console.error("Get messages error:", err);
-        res.status(500).json({ success: false, message: "Server error: " + err.message });
-    }
-});
-
-// Send a message
-app.post("/api/messages", authenticateToken, async (req, res) => {
-    try {
-        const { sender, receiver, text, txHash } = req.body;
-
-        if (!sender || !receiver || !text) {
-            return res.status(400).json({ success: false, message: "Missing required fields: sender, receiver, text" });
-        }
-
-        // Basic check if sender and receiver exist (optional, but good practice)
-        const senderExists = await User.findOne({ username: sender });
-        const receiverExists = await User.findOne({ username: receiver });
-        if (!senderExists || !receiverExists) {
-            return res.status(400).json({ success: false, message: "Sender or receiver does not exist." });
-        }
-
-        const message = new Message({
-            sender,
-            receiver,
-            text,
-            txHash: txHash || "",
-        });
-
-        await message.save();
-        res.status(201).json({ success: true, message: "Message sent", message });
-    } catch (err) {
-        console.error("Send message error:", err);
-        res.status(500).json({ success: false, message: "Server error: " + err.message });
-    }
-});
-
-// Delete all messages (for development/testing)
-app.delete("/api/messages", authenticateToken, async (req, res) => {
+app.get("/api/messages/:user1/:user2", async (req, res) => {
   try {
-    await Message.deleteMany({});
-    res.json({ success: true, message: "All messages deleted" });
+    const { user1, user2 } = req.params;
+    
+    const messages = await Message.find({
+      $or: [
+        { sender: user1, receiver: user2 },
+        { sender: user2, receiver: user1 }
+      ]
+    }).sort({ createdAt: 1 });
+
+    console.log(`Fetched ${messages.length} messages between ${user1} and ${user2}`);
+    res.json(messages);
   } catch (err) {
-    console.error("Delete all messages error:", err);
-    res.status(500).json({ success: false, message: "Server error: " + err.message });
+    console.error("Get messages error:", err);
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to fetch messages: " + err.message 
+    });
   }
 });
 
+// Send message
+app.post("/api/messages", async (req, res) => {
+  try {
+    const { sender, receiver, text, txHash } = req.body;
+
+    if (!sender || !receiver || !text) {
+      return res.status(400).json({
+        success: false,
+        message: "Sender, receiver, and text are required"
+      });
+    }
+
+    const message = new Message({
+      sender: sender.trim(),
+      receiver: receiver.trim(),
+      text: text.trim(),
+      txHash: txHash || null
+    });
+
+    const savedMessage = await message.save();
+    console.log(`Message sent from ${sender} to ${receiver}`);
+
+    res.status(201).json({
+      success: true,
+      message: "Message sent successfully",
+      data: savedMessage
+    });
+  } catch (err) {
+    console.error("Send message error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Failed to send message: " + err.message
+    });
+  }
+});
+
+// Delete all messages (admin function)
+app.delete("/api/messages", async (req, res) => {
+  try {
+    const result = await Message.deleteMany({});
+    console.log(`Deleted ${result.deletedCount} messages`);
+    res.json({
+      success: true,
+      message: `Deleted ${result.deletedCount} messages`,
+      deletedCount: result.deletedCount
+    });
+  } catch (err) {
+    console.error("Delete messages error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete messages: " + err.message
+    });
+  }
+});
+
+// Get user profile (protected route)
+app.get("/api/user/profile", authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id, '-password');
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
+    }
+    res.json({ success: true, user });
+  } catch (err) {
+    console.error("Get profile error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch profile: " + err.message
+    });
+  }
+});
+
+// Health check endpoint
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    mongodb: mongoose.connection.readyState === 1 ? "connected" : "disconnected"
+  });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({
+    success: false,
+    message: "Internal server error"
+  });
+});
+
+// Handle 404
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: "Route not found"
+  });
+});
 
 // ------------------- START SERVER -------------------
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 Backend running on port ${PORT}`);
+  console.log(`📡 Health check available at: http://localhost:${PORT}/api/health`);
 });
